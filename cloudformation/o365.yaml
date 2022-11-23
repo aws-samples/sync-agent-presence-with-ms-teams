@@ -1,0 +1,204 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#SPDX-License-Identifier: MIT-0
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template deploys the lambda function and secrets manager for office 365 integration
+
+Parameters:
+  AzureApplicationId:
+    Type: String
+    Description: Enter your o365 application Id
+  AzureClientSecret:
+    Type: String
+    Description: Enter your o365 client secret
+  AzureTenantId:
+    Type: String
+    Description: Enter your o365 tenant Id
+    
+Resources:
+# Copy code from source to target
+  SolutionSourceBucket:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        BucketEncryption: 
+          ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+# Create a role to copy Artifacts
+  CopyArtifactsLambdaIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${SolutionSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+                  - !Sub 'arn:aws:s3:::${SolutionSourceBucket}/*'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+# Pull code from deployment bucket to target
+  CustomResourceCopySourceFunction:
+      Type: 'AWS::Lambda::Function'
+      Properties:
+        Role: !GetAtt CopyArtifactsLambdaIamRole.Arn
+        Handler: "index.handler"
+        Runtime: "nodejs16.x"
+        Code:
+          ZipFile: |
+            // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+            // SPDX-License-Identifier: MIT-0
+            let copyResult;
+            let s3Result;
+            const s3 = new (require('aws-sdk')).S3();
+            const response = require('cfn-response');
+            const sourceBucket = 'aws-contact-center-blog';
+            const sourcePrefix = 'sync-agent-presence-with-ms-teams';
+            const sourceObjectArray = [
+              'lambda/o365.zip'
+            ];
+            exports.handler = async (event, context) => {
+                let result = {responseStatus: 'FAILED', responseData: {Data: 'Never updated'}};
+                try {
+                    console.log(`Received event with type ${event.RequestType}`); 
+                    if(event.RequestType === 'Create' || event.RequestType === 'Update') {
+                        copyResult = await Promise.all(
+                            sourceObjectArray.map( async (object) => {
+                                s3Result = await s3.copyObject({
+                                    Bucket: event.ResourceProperties.SolutionSourceBucket,
+                                    Key: object,
+                                    CopySource: `${sourceBucket}/${sourcePrefix}/${object}`
+                                }).promise();
+                                console.log(`Finished uploading File with result ${JSON.stringify(s3Result, 0, 4)}`);
+                            }),
+                        );
+                        result.responseStatus = 'SUCCESS';
+                        result.responseData['Data'] = 'Successfully uploaded files';
+                    } else if (event.RequestType === 'Delete') {
+                        result.responseStatus = 'SUCCESS';
+                        result.responseData['Data'] = 'Deployment S3 bucket is retained';
+                    }
+                } catch (error) {
+                    console.log(JSON.stringify(error, 0, 4));
+                    result.responseStatus = 'FAILED';
+                    result.responseData['Data'] = 'Failed to process event';
+                } finally {
+                    return await responsePromise(event, context, result.responseStatus, result.responseData, `mainstack`);
+                }
+            };
+            function responsePromise(event, context, responseStatus, responseData, physicalResourceId) {
+                return new Promise(() => response.send(event, context, responseStatus, responseData, physicalResourceId));
+            }
+        Timeout: 50
+        
+# Create a custom resource to copy artifacts
+  CopyCfnStacksLambdaTrigger:
+    Type: 'Custom::CopyCfnStacksLambdaTrigger'
+    Properties:
+      ServiceToken: !GetAtt CustomResourceCopySourceFunction.Arn
+      RequestToken: ${ClientRequestToken}
+      SolutionSourceBucket: !Ref SolutionSourceBucket
+
+  o365Secrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'MSFT secrets'
+      SecretString: !Join
+          - ''
+          - - '{ "app_id":"'
+            - !Ref AzureApplicationId
+            - '"'
+            - ','
+            - '"client_secret": "'
+            - !Ref AzureClientSecret
+            - '"'
+            - ','
+            - '"tenant_id": "'
+            - !Ref AzureTenantId
+            - '"'
+            - '}'
+      
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns: ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+      Policies:
+        -
+          PolicyName: "lambda-o365-helper-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "secretsmanager:getSecretValue"
+                Resource: !Ref o365Secrets
+
+  o365Lambda:
+    Type: "AWS::Lambda::Function"
+    DependsOn: CopyCfnStacksLambdaTrigger
+    Properties:
+      Code:
+        S3Bucket: !Ref SolutionSourceBucket
+        S3Key: "lambda/o365.zip"
+      Description: "This function will sync Amazon Connect agent status with MS Teams"
+      FunctionName: !Sub "${AWS::StackName}-o365"
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "python3.9"
+      Environment:
+        Variables:
+          Secret: !Ref o365Secrets
+      Timeout: 8
+
